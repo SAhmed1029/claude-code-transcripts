@@ -1,0 +1,153 @@
+{#- Macros for rendering different content types in markdown -#}
+
+{#- Extract filename from path -#}
+{% macro filename(path) -%}
+{{ path.split('/')[-1] if '/' in path else path }}
+{%- endmacro %}
+
+{#- Render a thinking block -#}
+{% macro thinking(content) -%}
+<details>
+<summary>💭 Thinking</summary>
+
+{{ content }}
+
+</details>
+{%- endmacro %}
+
+{#- Render a todo list with checkboxes -#}
+{% macro todo_list(todos) -%}
+{% for todo in todos -%}
+{% if todo.status == 'completed' -%}
+- [x] {{ todo.content }}
+{% elif todo.status == 'in_progress' -%}
+- [ ] {{ todo.content }} *(in progress)*
+{% else -%}
+- [ ] {{ todo.content }}
+{% endif -%}
+{% endfor -%}
+{%- endmacro %}
+
+{#- Render a Write tool call -#}
+{% macro write_tool(file_path, content) -%}
+**Write** `{{ filename(file_path) }}`
+<details>
+<summary>{{ file_path }}</summary>
+
+```
+{{ content }}
+```
+
+</details>
+{%- endmacro %}
+
+{#- Render an Edit tool call -#}
+{% macro edit_tool(file_path, old_string, new_string, replace_all) -%}
+**Edit** `{{ filename(file_path) }}`{% if replace_all %} *(replace all)*{% endif %}
+
+```diff
+- {{ old_string | replace('\n', '\n- ') }}
++ {{ new_string | replace('\n', '\n+ ') }}
+```
+{%- endmacro %}
+
+{#- Render a Bash tool call -#}
+{% macro bash_tool(command, description) -%}
+{% if description -%}
+**Bash**: {{ description }}
+{% else -%}
+**Bash**
+{% endif %}
+```bash
+{{ command }}
+```
+{%- endmacro %}
+
+{#- Render a generic tool call -#}
+{% macro tool_use(tool_name, description, input_json) -%}
+**{{ tool_name }}**{% if description %}: {{ description }}{% endif %}
+
+```json
+{{ input_json }}
+```
+{%- endmacro %}
+
+{#- Render a tool result -#}
+{% macro tool_result(content, is_error) -%}
+{% if is_error -%}
+> ⚠️ **Error**
+{% endif -%}
+```
+{{ content }}
+```
+{%- endmacro %}
+
+{#- Render a commit -#}
+{% macro commit(hash, message, github_repo) -%}
+{% if github_repo -%}
+[`{{ hash[:7] }}`](https://github.com/{{ github_repo }}/commit/{{ hash }}) {{ message }}
+{%- else -%}
+`{{ hash[:7] }}` {{ message }}
+{%- endif %}
+{%- endmacro %}
+
+{#- Create a header from user prompt text (first X words) -#}
+{% macro prompt_header(text, max_words=6) -%}
+{%- set words = text.split()[:max_words] -%}
+{%- set header = words | join(' ') -%}
+{%- if text.split() | length > max_words -%}
+{{ header }}...
+{%- else -%}
+{{ header }}
+{%- endif -%}
+{%- endmacro %}
+
+{#- Main template starts here -#}
+# Claude Code Transcript
+
+{% for conversation in conversations -%}
+{% if not conversation.is_continuation -%}
+## {{ prompt_header(conversation.user_text) }}
+
+{% endif -%}
+{% for message in conversation.messages -%}
+{% if message.role == 'user' and message.is_prompt -%}
+**User**: {{ message.content }}
+
+{% elif message.role == 'user' and message.is_tool_result -%}
+{% for block in message.blocks -%}
+{% if block.type == 'tool_result' -%}
+{{ tool_result(block.content, block.is_error) }}
+
+{% endif -%}
+{% endfor -%}
+{% elif message.role == 'assistant' -%}
+{% for block in message.blocks -%}
+{% if block.type == 'thinking' -%}
+{{ thinking(block.thinking) }}
+
+{% elif block.type == 'text' -%}
+{{ block.text }}
+
+{% elif block.type == 'tool_use' -%}
+{% if block.name == 'TodoWrite' -%}
+{{ todo_list(block.input.todos) }}
+
+{% elif block.name == 'Write' -%}
+{{ write_tool(block.input.file_path, block.input.content) }}
+
+{% elif block.name == 'Edit' -%}
+{{ edit_tool(block.input.file_path, block.input.old_string, block.input.new_string, block.input.replace_all | default(false)) }}
+
+{% elif block.name == 'Bash' -%}
+{{ bash_tool(block.input.command, block.input.description | default('')) }}
+
+{% else -%}
+{{ tool_use(block.name, block.input.description | default(''), block.input_json) }}
+
+{% endif -%}
+{% endif -%}
+{% endfor -%}
+{% endif -%}
+{% endfor -%}
+{% endfor -%}

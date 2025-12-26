@@ -16,12 +16,19 @@ from click_default_group import DefaultGroup
 import httpx
 from jinja2 import Environment, PackageLoader
 import markdown
+import pyperclip
 import questionary
 
-# Set up Jinja2 environment
+# Set up Jinja2 environment for HTML (with autoescape)
 _jinja_env = Environment(
     loader=PackageLoader("claude_code_transcripts", "templates"),
     autoescape=True,
+)
+
+# Set up Jinja2 environment for Markdown (without autoescape)
+_jinja_env_md = Environment(
+    loader=PackageLoader("claude_code_transcripts", "templates"),
+    autoescape=False,
 )
 
 # Load macros template and expose macros
@@ -31,6 +38,8 @@ _macros = _macros_template.module
 
 def get_template(name):
     """Get a Jinja2 template by name."""
+    if name.endswith(".jinja2"):
+        return _jinja_env_md.get_template(name)
     return _jinja_env.get_template(name)
 
 
@@ -985,6 +994,167 @@ def generate_html(json_path, output_dir, github_repo=None):
     )
 
 
+def generate_markdown(json_path, github_repo=None):
+    """Generate markdown from a session file.
+
+    Returns the markdown content as a string.
+    """
+    # Load session file (supports both JSON and JSONL)
+    data = parse_session_file(json_path)
+    return generate_markdown_from_data(data, github_repo)
+
+
+def generate_markdown_from_data(data, github_repo=None):
+    """Generate markdown from session data dict.
+
+    Returns the markdown content as a string.
+    """
+    loglines = data.get("loglines", [])
+
+    # Auto-detect GitHub repo if not provided
+    if github_repo is None:
+        github_repo = detect_github_repo(loglines)
+
+    # Build conversations list for the template
+    conversations = []
+    current_conv = None
+
+    for entry in loglines:
+        log_type = entry.get("type")
+        timestamp = entry.get("timestamp", "")
+        is_compact_summary = entry.get("isCompactSummary", False)
+        message_data = entry.get("message", {})
+        if not message_data:
+            continue
+
+        is_user_prompt = False
+        user_text = None
+        if log_type == "user":
+            content = message_data.get("content", "")
+            if isinstance(content, str) and content.strip():
+                is_user_prompt = True
+                user_text = content
+
+        if is_user_prompt:
+            if current_conv:
+                conversations.append(current_conv)
+            current_conv = {
+                "user_text": user_text,
+                "timestamp": timestamp,
+                "messages": [],
+                "is_continuation": bool(is_compact_summary),
+            }
+            # Add user message
+            current_conv["messages"].append(
+                {
+                    "role": "user",
+                    "is_prompt": True,
+                    "is_tool_result": False,
+                    "content": user_text,
+                    "blocks": [],
+                }
+            )
+        elif current_conv:
+            # Process message content
+            content = message_data.get("content", [])
+            if log_type == "user":
+                # Tool results
+                if isinstance(content, list):
+                    blocks = []
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                        ):
+                            # Check for commits in tool results
+                            result_content = block.get("content", "")
+                            if isinstance(result_content, str):
+                                # Check for git commits
+                                for match in COMMIT_PATTERN.finditer(result_content):
+                                    commit_hash = match.group(1)
+                                    commit_msg = match.group(2)
+                                    blocks.append(
+                                        {
+                                            "type": "commit",
+                                            "hash": commit_hash,
+                                            "message": commit_msg,
+                                            "github_repo": github_repo,
+                                        }
+                                    )
+                            blocks.append(
+                                {
+                                    "type": "tool_result",
+                                    "content": (
+                                        result_content
+                                        if isinstance(result_content, str)
+                                        else json.dumps(result_content, indent=2)
+                                    ),
+                                    "is_error": block.get("is_error", False),
+                                }
+                            )
+                    if blocks:
+                        current_conv["messages"].append(
+                            {
+                                "role": "user",
+                                "is_prompt": False,
+                                "is_tool_result": True,
+                                "content": "",
+                                "blocks": blocks,
+                            }
+                        )
+            elif log_type == "assistant":
+                if isinstance(content, list):
+                    blocks = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type", "")
+                            if block_type == "thinking":
+                                blocks.append(
+                                    {
+                                        "type": "thinking",
+                                        "thinking": block.get("thinking", ""),
+                                    }
+                                )
+                            elif block_type == "text":
+                                blocks.append(
+                                    {"type": "text", "text": block.get("text", "")}
+                                )
+                            elif block_type == "tool_use":
+                                tool_input = block.get("input", {})
+                                blocks.append(
+                                    {
+                                        "type": "tool_use",
+                                        "name": block.get("name", "Unknown"),
+                                        "input": tool_input,
+                                        "input_json": json.dumps(
+                                            {
+                                                k: v
+                                                for k, v in tool_input.items()
+                                                if k != "description"
+                                            },
+                                            indent=2,
+                                        ),
+                                    }
+                                )
+                    if blocks:
+                        current_conv["messages"].append(
+                            {
+                                "role": "assistant",
+                                "is_prompt": False,
+                                "is_tool_result": False,
+                                "content": "",
+                                "blocks": blocks,
+                            }
+                        )
+
+    if current_conv:
+        conversations.append(current_conv)
+
+    # Render the markdown template
+    md_template = get_template("markdown.jinja2")
+    return md_template.render(conversations=conversations, github_repo=github_repo)
+
+
 @click.group(cls=DefaultGroup, default="local", default_if_no_args=True)
 @click.version_option(None, "-v", "--version", package_name="claude-code-transcripts")
 def cli():
@@ -1031,7 +1201,29 @@ def cli():
     default=10,
     help="Maximum number of sessions to show (default: 10)",
 )
-def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit):
+@click.option(
+    "--markdown",
+    "include_markdown",
+    is_flag=True,
+    help="Also export the transcript to a markdown file.",
+)
+@click.option(
+    "--copy",
+    "copy_to_clipboard",
+    is_flag=True,
+    help="Copy the markdown transcript to the clipboard.",
+)
+def local_cmd(
+    output,
+    output_auto,
+    repo,
+    gist,
+    include_json,
+    open_browser,
+    limit,
+    include_markdown,
+    copy_to_clipboard,
+):
     """Select and convert a local Claude Code session to HTML."""
     from datetime import datetime
 
@@ -1097,6 +1289,22 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
         json_size_kb = json_dest.stat().st_size / 1024
         click.echo(f"JSONL: {json_dest} ({json_size_kb:.1f} KB)")
 
+    # Generate markdown if requested (--copy implies --markdown)
+    if include_markdown or copy_to_clipboard:
+        output.mkdir(exist_ok=True)
+        md_content = generate_markdown(session_file, github_repo=repo)
+        md_dest = output / "transcript.md"
+        md_dest.write_text(md_content, encoding="utf-8")
+        md_size_kb = md_dest.stat().st_size / 1024
+        click.echo(f"Markdown: {md_dest} ({md_size_kb:.1f} KB)")
+
+        if copy_to_clipboard:
+            try:
+                pyperclip.copy(md_content)
+                click.echo("Copied to clipboard!")
+            except pyperclip.PyperclipException as e:
+                click.echo(f"Could not copy to clipboard: {e}")
+
     if gist:
         # Inject gist preview JS and create gist
         inject_gist_preview_js(output)
@@ -1146,7 +1354,29 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
     is_flag=True,
     help="Open the generated index.html in your default browser (default if no -o specified).",
 )
-def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_browser):
+@click.option(
+    "--markdown",
+    "include_markdown",
+    is_flag=True,
+    help="Also export the transcript to a markdown file.",
+)
+@click.option(
+    "--copy",
+    "copy_to_clipboard",
+    is_flag=True,
+    help="Copy the markdown transcript to the clipboard.",
+)
+def json_cmd(
+    json_file,
+    output,
+    output_auto,
+    repo,
+    gist,
+    include_json,
+    open_browser,
+    include_markdown,
+    copy_to_clipboard,
+):
     """Convert a Claude Code session JSON/JSONL file to HTML."""
     # Determine output directory and whether to open browser
     # If no -o specified, use temp dir and open browser by default
@@ -1172,6 +1402,22 @@ def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_brow
         shutil.copy(json_file, json_dest)
         json_size_kb = json_dest.stat().st_size / 1024
         click.echo(f"JSON: {json_dest} ({json_size_kb:.1f} KB)")
+
+    # Generate markdown if requested (--copy implies --markdown)
+    if include_markdown or copy_to_clipboard:
+        output.mkdir(exist_ok=True)
+        md_content = generate_markdown(json_file, github_repo=repo)
+        md_dest = output / "transcript.md"
+        md_dest.write_text(md_content, encoding="utf-8")
+        md_size_kb = md_dest.stat().st_size / 1024
+        click.echo(f"Markdown: {md_dest} ({md_size_kb:.1f} KB)")
+
+        if copy_to_clipboard:
+            try:
+                pyperclip.copy(md_content)
+                click.echo("Copied to clipboard!")
+            except pyperclip.PyperclipException as e:
+                click.echo(f"Could not copy to clipboard: {e}")
 
     if gist:
         # Inject gist preview JS and create gist
@@ -1440,6 +1686,18 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
     is_flag=True,
     help="Open the generated index.html in your default browser (default if no -o specified).",
 )
+@click.option(
+    "--markdown",
+    "include_markdown",
+    is_flag=True,
+    help="Also export the transcript to a markdown file.",
+)
+@click.option(
+    "--copy",
+    "copy_to_clipboard",
+    is_flag=True,
+    help="Copy the markdown transcript to the clipboard.",
+)
 def web_cmd(
     session_id,
     output,
@@ -1450,6 +1708,8 @@ def web_cmd(
     gist,
     include_json,
     open_browser,
+    include_markdown,
+    copy_to_clipboard,
 ):
     """Select and convert a web session from the Claude API to HTML.
 
@@ -1534,6 +1794,22 @@ def web_cmd(
             json.dump(session_data, f, indent=2)
         json_size_kb = json_dest.stat().st_size / 1024
         click.echo(f"JSON: {json_dest} ({json_size_kb:.1f} KB)")
+
+    # Generate markdown if requested (--copy implies --markdown)
+    if include_markdown or copy_to_clipboard:
+        output.mkdir(exist_ok=True)
+        md_content = generate_markdown_from_data(session_data, github_repo=repo)
+        md_dest = output / "transcript.md"
+        md_dest.write_text(md_content, encoding="utf-8")
+        md_size_kb = md_dest.stat().st_size / 1024
+        click.echo(f"Markdown: {md_dest} ({md_size_kb:.1f} KB)")
+
+        if copy_to_clipboard:
+            try:
+                pyperclip.copy(md_content)
+                click.echo("Copied to clipboard!")
+            except pyperclip.PyperclipException as e:
+                click.echo(f"Could not copy to clipboard: {e}")
 
     if gist:
         # Inject gist preview JS and create gist

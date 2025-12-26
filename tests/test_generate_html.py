@@ -1373,3 +1373,282 @@ class TestOutputAutoOption:
         expected_dir = tmp_path / "sample_session"
         assert expected_dir.exists()
         assert (expected_dir / "index.html").exists()
+
+
+class MarkdownSnapshotExtension(SingleFileSnapshotExtension):
+    """Snapshot extension that saves Markdown files."""
+
+    _write_mode = WriteMode.TEXT
+    file_extension = "md"
+
+
+@pytest.fixture
+def snapshot_md(snapshot):
+    """Fixture for Markdown file snapshots."""
+    return snapshot.use_extension(MarkdownSnapshotExtension)
+
+
+class TestMarkdownGeneration:
+    """Tests for the generate_markdown function."""
+
+    def test_generates_markdown_file(self, output_dir, snapshot_md):
+        """Test markdown file generation from session."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path, github_repo="example/project")
+
+        assert result == snapshot_md
+
+    def test_markdown_has_headers_for_user_prompts(self, output_dir):
+        """Test that markdown uses headers for user prompts."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path)
+
+        # Headers should be created from first X words of user prompts
+        assert "## Create a simple Python" in result
+        assert "## Now edit the file" in result
+        assert "## Run the tests again" in result
+
+    def test_markdown_renders_todos_with_checkboxes(self, output_dir):
+        """Test that todos are rendered with markdown checkbox syntax."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path)
+
+        # Completed todos should use [x]
+        assert "- [x] Create add function" in result
+        # Pending todos should use [ ]
+        assert "- [ ] Push to remote" in result
+
+    def test_markdown_renders_code_with_fenced_blocks(self, output_dir):
+        """Test that code is rendered with fenced code blocks."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path)
+
+        # Should have fenced code blocks with language tags
+        assert "```python" in result or "```" in result
+
+    def test_markdown_indicates_thinking_blocks(self, output_dir):
+        """Test that thinking blocks are clearly indicated."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path)
+
+        # Thinking should be indicated (with emoji or other marker)
+        assert "thinking" in result.lower() or "💭" in result
+
+    def test_markdown_includes_commit_links(self, output_dir):
+        """Test that commit hashes link to GitHub."""
+        from claude_code_transcripts import generate_markdown
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        result = generate_markdown(fixture_path, github_repo="example/project")
+
+        # Commit links should be included
+        assert "abc1234" in result
+        assert "github.com/example/project" in result
+
+
+class TestMarkdownOption:
+    """Tests for the --markdown CLI option."""
+
+    def test_json_markdown_creates_file(self, output_dir):
+        """Test that json --markdown creates a markdown file."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["json", str(fixture_path), "-o", str(output_dir), "--markdown"],
+        )
+
+        assert result.exit_code == 0
+        md_file = output_dir / "transcript.md"
+        assert md_file.exists()
+        assert "Markdown:" in result.output
+
+    def test_local_markdown_creates_file(self, tmp_path, monkeypatch):
+        """Test that local --markdown creates a markdown file."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+        import questionary
+
+        # Create mock .claude/projects structure
+        projects_dir = tmp_path / ".claude" / "projects" / "test-project"
+        projects_dir.mkdir(parents=True)
+
+        session_file = projects_dir / "session-123.jsonl"
+        session_file.write_text(
+            '{"type":"summary","summary":"Test session"}\n'
+            '{"type":"user","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"Hello world test"}}\n'
+        )
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Mock Path.home() to return our tmp_path
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        # Mock questionary.select to return the session file
+        class MockSelect:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def ask(self):
+                return session_file
+
+        monkeypatch.setattr(questionary, "select", MockSelect)
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["local", "-o", str(output_dir), "--markdown"])
+
+        assert result.exit_code == 0
+        md_file = output_dir / "transcript.md"
+        assert md_file.exists()
+
+    def test_web_markdown_creates_file(self, httpx_mock, output_dir):
+        """Test that web --markdown creates a markdown file."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+
+        # Load sample session to mock API response
+        fixture_path = Path(__file__).parent / "sample_session.json"
+        with open(fixture_path) as f:
+            session_data = json.load(f)
+
+        httpx_mock.add_response(
+            url="https://api.anthropic.com/v1/session_ingress/session/test-session-id",
+            json=session_data,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "web",
+                "test-session-id",
+                "--token",
+                "test-token",
+                "--org-uuid",
+                "test-org",
+                "-o",
+                str(output_dir),
+                "--markdown",
+            ],
+        )
+
+        assert result.exit_code == 0
+        md_file = output_dir / "transcript.md"
+        assert md_file.exists()
+
+
+class TestCopyOption:
+    """Tests for the --copy CLI option."""
+
+    def test_copy_copies_to_clipboard(self, output_dir, monkeypatch):
+        """Test that --copy copies markdown to clipboard."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+
+        # Track clipboard content
+        clipboard_content = []
+
+        def mock_copy(text):
+            clipboard_content.append(text)
+
+        monkeypatch.setattr("claude_code_transcripts.pyperclip.copy", mock_copy)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["json", str(fixture_path), "-o", str(output_dir), "--copy"],
+        )
+
+        assert result.exit_code == 0
+        assert len(clipboard_content) == 1
+        assert "Create a simple Python" in clipboard_content[0]
+        assert "Copied to clipboard" in result.output
+
+    def test_copy_implies_markdown(self, output_dir, monkeypatch):
+        """Test that --copy implies --markdown (creates md file)."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+
+        # Mock clipboard
+        def mock_copy(text):
+            pass
+
+        monkeypatch.setattr("claude_code_transcripts.pyperclip.copy", mock_copy)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["json", str(fixture_path), "-o", str(output_dir), "--copy"],
+        )
+
+        assert result.exit_code == 0
+        # Even without --markdown, the md file should be created because --copy implies it
+        md_file = output_dir / "transcript.md"
+        assert md_file.exists()
+
+    def test_copy_with_markdown_only_copies_once(self, output_dir, monkeypatch):
+        """Test that --copy --markdown only copies once."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+
+        # Track clipboard calls
+        copy_calls = []
+
+        def mock_copy(text):
+            copy_calls.append(text)
+
+        monkeypatch.setattr("claude_code_transcripts.pyperclip.copy", mock_copy)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["json", str(fixture_path), "-o", str(output_dir), "--markdown", "--copy"],
+        )
+
+        assert result.exit_code == 0
+        assert len(copy_calls) == 1
+
+    def test_copy_handles_clipboard_unavailable(self, output_dir, monkeypatch):
+        """Test that --copy handles clipboard unavailable gracefully."""
+        from click.testing import CliRunner
+        from claude_code_transcripts import cli
+        import pyperclip
+
+        fixture_path = Path(__file__).parent / "sample_session.json"
+
+        # Mock clipboard to raise an exception
+        def mock_copy(text):
+            raise pyperclip.PyperclipException("No clipboard mechanism found")
+
+        monkeypatch.setattr("claude_code_transcripts.pyperclip.copy", mock_copy)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["json", str(fixture_path), "-o", str(output_dir), "--copy"],
+        )
+
+        # Should not crash, but show a warning
+        assert result.exit_code == 0
+        assert "clipboard" in result.output.lower()
